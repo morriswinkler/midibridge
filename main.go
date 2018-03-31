@@ -75,7 +75,9 @@ const (
 )
 
 var (
-	mididev = flag.String("mididev", "", "midi in and out device")
+	midiInDev  = flag.String("midi-in", "", "midi in device [/dev/snd/midi...]")
+	midiOutDev = flag.String("midi-out", "", "midi out device [/dev/snd/midi...]")
+	midiDev    = flag.String("midi", "", "midi in and out device [/dev/snd/midi...]")
 )
 
 type Midi struct {
@@ -99,6 +101,8 @@ type MidiBridge struct {
 	mu      sync.RWMutex
 	MidiIn  *os.File
 	MidiOut *os.File
+
+	close chan bool
 }
 
 func NewMidiBridge(in, out *os.File) *MidiBridge {
@@ -109,6 +113,10 @@ func NewMidiBridge(in, out *os.File) *MidiBridge {
 	}
 }
 
+func (m *MidiBridge) Close() {
+	m.close <- true
+}
+
 func (m *MidiBridge) Write(data []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -116,13 +124,44 @@ func (m *MidiBridge) Write(data []byte) {
 	m.MidiOut.Write(data)
 }
 
-func (m *MidiBridge) handleMidi(req []byte) {
+func (m *MidiBridge) ListenMidiIn() {
+
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := m.MidiIn.Read(buf)
+			if err != nil {
+				log.Fatal(err)
+			}
+			bufCopy := make([]byte, n)
+			copy(bufCopy, buf)
+			m.handleDeviceIn(bufCopy)
+		}
+	}()
+
+	for {
+		select {
+		case _, _ = <-m.close:
+			return
+		}
+	}
+}
+
+func (m *MidiBridge) handleDeviceIn(req []byte) {
+	fmt.Print("Midi Device In: ")
+	for i := range req {
+		fmt.Printf("%08b", req[i])
+	}
+	fmt.Println()
+}
+
+func (m *MidiBridge) handleBridgeIn(req []byte) {
 
 	if len(req) != 11 {
 		return
 	}
 
-	fmt.Println("MidiNote: ", ToMidi(req))
+	fmt.Printf("MidiNote: %+v\n", ToMidi(req))
 
 	m.Write([]byte{req[10], req[9], req[8]})
 }
@@ -132,7 +171,7 @@ func (m *MidiBridge) handleCmd(req []byte) {
 	switch {
 	case string(req[:len(midiCall)]) == midiCall:
 		req := req[len(midiCall):]
-		m.handleMidi(req)
+		m.handleBridgeIn(req)
 
 	default:
 		fmt.Printf("%s not implemeted\n", req)
@@ -144,13 +183,26 @@ func main() {
 
 	flag.Parse()
 
-	midiDevice, err := os.OpenFile(*mididev, os.O_RDWR, 0666)
+	if *midiDev != "" {
+		*midiInDev = *midiDev
+		*midiOutDev = *midiDev
+	}
+
+	midiIn, err := os.OpenFile(*midiInDev, os.O_RDONLY, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer midiDevice.Close()
+	defer midiIn.Close()
+	midiOut, err := os.OpenFile(*midiOutDev, os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer midiOut.Close()
 
-	bridge := NewMidiBridge(midiDevice, midiDevice)
+	bridge := NewMidiBridge(midiIn, midiOut)
+	defer bridge.Close()
+
+	go bridge.ListenMidiIn()
 
 	udpSrv, err := net.ListenPacket(udp, port)
 	if err != nil {
